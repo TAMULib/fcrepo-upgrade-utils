@@ -30,6 +30,7 @@ import static org.fcrepo.upgrade.utils.RdfConstants.MEMENTO;
 import static org.fcrepo.upgrade.utils.RdfConstants.NON_RDF_SOURCE_DESCRIPTION;
 import static org.slf4j.LoggerFactory.getLogger;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.File;
@@ -57,12 +58,11 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.jena.rdf.model.Model;
 import org.apache.jena.rdf.model.ModelFactory;
+import org.apache.jena.rdf.model.NodeIterator;
 import org.apache.jena.rdf.model.Resource;
 import org.apache.jena.rdf.model.ResourceFactory;
 import org.apache.jena.rdf.model.Statement;
@@ -133,7 +133,12 @@ class F47ToF5UpgradeManager extends UpgradeManagerBase implements UpgradeManager
 
         if (isVersionedResource) {
             versionTimestamp = resolveMementoTimestamp(path);
-            relativeNewLocation = resolveNewVersionedResourceLocation(path, versionTimestamp);
+            if (versionTimestamp == null) {
+                LOGGER.warn("The versionTimestamp is NULL, setting relativeNewLocation to relativePath {} for path {}.", relativePath, path);
+                relativeNewLocation = relativePath;
+            } else {
+                relativeNewLocation = resolveNewVersionedResourceLocation(path, versionTimestamp);
+            }
         } else {
             versionTimestamp = null;
             relativeNewLocation = relativePath;
@@ -344,32 +349,41 @@ class F47ToF5UpgradeManager extends UpgradeManagerBase implements UpgradeManager
         //determine the location of new acl
         final var authorizations = new LinkedHashMap<String, List<Statement>>();
         var authIndex = new AtomicInteger(0);
-        try (final Stream<Path> list = Files.walk(aclDirectory)) {
-            list.filter(Files::isRegularFile).forEach(authFile -> {
-                 final var model = createModelFromFile(authFile);
-                final var authName = "auth" + authIndex.get();
-                final var subject = createResource(newAclResource + "#" + authName);
-                final var isAuthorization = new AtomicBoolean(false);
-                final var authTriples = new ArrayList<Statement>();
-                model.listStatements().toList().stream().filter(x-> {
-                    //filter only rdf type Authorization and acl namespace  predicates
-                    return (x.getPredicate().equals(RDF.type) && x.getObject().asResource().equals(AUTHORIZATION)) ||
-                           x.getPredicate().toString().startsWith(ACL_NS);
-                }).forEach(x->{
-                    var object = x.getObject();
-                    if (x.getPredicate().equals(RDF.type) && x.getObject().asResource().equals(AUTHORIZATION)) {
-                        isAuthorization.set(true);
-                    }
-                    authTriples.add(model.createStatement(subject, x.getPredicate(), object));
-                });
 
-                authIndex.incrementAndGet();
-                if (isAuthorization.get()) {
-                    authorizations.put(authName, authTriples);
-                }
-            });
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+        if (Files.exists(aclDirectory)) {
+            try (final Stream<Path> list = Files.walk(aclDirectory)) {
+                list.filter(Files::isRegularFile).forEach(authFile -> {
+                    if (!Files.exists(authFile)) {
+                        LOGGER.warn("The authFile {} does not exist when processing the aclDirectory {} of convertedProtectedResourceLocation {}.", authFile, aclDirectory.getFileName(), convertedProtectedResourceLocation);
+                        return;
+                    }
+                     final var model = createModelFromFile(authFile);
+                    final var authName = "auth" + authIndex.get();
+                    final var subject = createResource(newAclResource + "#" + authName);
+                    final var isAuthorization = new AtomicBoolean(false);
+                    final var authTriples = new ArrayList<Statement>();
+                    model.listStatements().toList().stream().filter(x-> {
+                        //filter only rdf type Authorization and acl namespace  predicates
+                        return (x.getPredicate().equals(RDF.type) && x.getObject().asResource().equals(AUTHORIZATION)) ||
+                               x.getPredicate().toString().startsWith(ACL_NS);
+                    }).forEach(x->{
+                        var object = x.getObject();
+                        if (x.getPredicate().equals(RDF.type) && x.getObject().asResource().equals(AUTHORIZATION)) {
+                            isAuthorization.set(true);
+                        }
+                        authTriples.add(model.createStatement(subject, x.getPredicate(), object));
+                    });
+
+                    authIndex.incrementAndGet();
+                    if (isAuthorization.get()) {
+                        authorizations.put(authName, authTriples);
+                    }
+                });
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            LOGGER.warn("The aclDirectory at {} does not exist for convertedProtectedResourceLocation {}.", aclDirectory.getFileName(), convertedProtectedResourceLocation);
         }
 
         //create new model
@@ -447,10 +461,15 @@ class F47ToF5UpgradeManager extends UpgradeManagerBase implements UpgradeManager
         final var versionsContainer = resolveVersionsContainer(path);
         //read the versions container in order to resolve the version timestamp
         final Model versionsContainerModel = createModelFromFile(versionsContainer);
-        final var iso8601Timestamp = versionsContainerModel.listObjectsOfProperty(subject, FEDORA_CREATED_DATE)
-                                                           .next().asLiteral().getString();
-        //create memento id based on RFC 8601 timestamp
-        return ISO_DATE_TIME_FORMATTER.parse(iso8601Timestamp);
+        final NodeIterator nodeIter = versionsContainerModel.listObjectsOfProperty(subject, FEDORA_CREATED_DATE);
+
+        if (nodeIter.hasNext()) {
+            final var iso8601Timestamp = nodeIter.next().asLiteral().getString();
+            //create memento id based on RFC 8601 timestamp
+            return ISO_DATE_TIME_FORMATTER.parse(iso8601Timestamp);
+        }
+
+        return null;
     }
 
     private Model createModelFromFile(final Path path) {
